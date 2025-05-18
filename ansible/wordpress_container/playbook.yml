@@ -1,0 +1,130 @@
+---
+- name: Deploy and configure TurnKey WordPress LXC
+  hosts: localhost
+  become: true
+  vars:
+    hostname: wordpress
+    template: "debian-12-turnkey-wordpress_18.2-1_amd64.tar.gz"
+    storage: ceph_store
+    memory: 1024
+    cores: 1
+    disk_size: 30
+    net_bridge: vmbr0
+    ip_prefix: 10.24.17.
+    subnet_suffix: /24
+    gateway: 10.24.17.1
+    root_password: Nuklid_8001
+    mysql_password: Nuklid_8001
+    wp_password: Nuklid_8001
+    wp_email: admin@example.com
+    wp_domain: ""
+    timezone: Europe/Amsterdam
+    ct_id: ""
+    full_hostname: ""
+    proxmox_api_user: "wordpress_crt@pam"
+    proxmox_token_id: "wp_crt"
+    proxmox_api_token: "22b80f8e-902c-4b56-a596-23fbd48e3e06"
+    proxmox_api_host: 10.24.17.12
+    proxmox_node: pve2
+
+  tasks:
+    - name: Get max VMID from existing containers
+      shell: "pct list | awk 'NR>1 {print $1}' | sort -n | tail -n 1"
+      register: max_vmid
+      become: true
+      delegate_to: "{{ proxmox_node }}"
+
+    - name: Set next available CT ID
+      set_fact:
+        ct_id: "{{ [(max_vmid.stdout | int) + 1, 210] | max }}"
+
+
+    - name: Set full hostname and up address
+      set_fact:
+        full_hostname: "{{ hostname }}{{ ct_id }}"
+        ip_address: "{{ ip_prefix }}{{ ct_id }}"
+        wp_domain: "{{ ip_prefix }}{{ ct_id }}"
+
+
+    - name: Create the WordPress LXC container
+      community.general.proxmox:
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_token_id }}"
+        api_token_secret: "{{ proxmox_api_token }}"
+        api_host: "{{ proxmox_api_host }}"
+        vmid: "{{ ct_id }}"
+        hostname: "{{ full_hostname }}"
+        node: "{{ proxmox_node }}"
+        password: "{{ root_password }}"
+        storage: "{{ storage }}"
+        ostemplate: "local:vztmpl/{{ template }}"
+        memory: "{{ memory }}"
+        cores: "{{ cores }}"
+        netif: '{"net0":"name=eth0,bridge={{ net_bridge }},ip={{ ip_address }}{{ subnet_suffix }},gw={{ gateway }}"}'
+        disk: "{{ storage }}:{{ disk_size }}"
+        state: present
+
+    - name: remove old ssh host
+      ansible.builtin.command:
+        cmd: ssh-keygen -f "/root/.ssh/known_hosts" -R "{{ip_address}}"
+      ignore_errors: yes
+
+
+    - name: Mount the container rootfs
+      command: pct mount {{ ct_id }}
+      become: true
+      delegate_to: "{{ proxmox_node }}"
+
+    - name: Copy inithooks preseed into the container rootfs
+      copy:
+        dest: "/var/lib/lxc/{{ ct_id }}/rootfs/etc/inithooks.conf"
+        content: |
+          export ROOT_PASS={{ root_password }}
+          export DB_PASS={{ mysql_password }}
+          export APP_PASS={{ wp_password }}
+          export APP_EMAIL={{ wp_email }}
+          export APP_DOMAIN={{ wp_domain }}
+          export HUB_APIKEY=SKIP
+          export SEC_ALERTS=SKIP
+          export SEC_UPDATES=FORCE
+          export TZ={{ timezone }}
+      become: true
+      delegate_to: "{{ proxmox_node }}"
+
+    - name: Unmount the container rootfs
+      command: pct unmount {{ ct_id }}
+      become: true
+      delegate_to: "{{ proxmox_node }}"
+
+
+
+    - name: Start the container
+      community.general.proxmox:
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_token_id }}"
+        api_token_secret: "{{ proxmox_api_token }}"
+        api_host: "{{ proxmox_api_host }}"
+        vmid: "{{ ct_id }}"
+        node: "{{ proxmox_node }}"
+        state: started
+
+    - name: Wait for SSH to be ready
+      wait_for:
+        host: "{{ ip_address }}"
+        port: 22
+        timeout: 60
+
+    - name: Enable HA for CT using raw API
+      ansible.builtin.uri:
+        url: "https://{{ proxmox_api_host }}:8006/api2/json/cluster/ha/resources"
+        method: POST
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_token_id }}={{ proxmox_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          sid: "ct:{{ ct_id }}"
+          group: "Availability"
+          comment: "Enable HA for CT {{ ct_id }}"
+        validate_certs: false
+      delegate_to: localhost

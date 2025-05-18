@@ -1,0 +1,100 @@
+---
+- name: Install dependencies
+  apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg
+    state: present
+    update_cache: yes
+
+
+- name: Remove conflicting containerd package
+  apt:
+    name: containerd.io
+    state: absent
+  become: true
+
+
+- name: Clean up the apt cache to resolve any issues
+  apt:
+    autoclean: yes
+    autoremove: yes
+  become: true
+
+- name: Update apt package list
+  apt:
+    update_cache: yes
+  become: true
+
+
+- name: Install required Python packages in venv
+  command: /opt/ansible_venv/bin/pip install docker<7.0.0 requests<2.32.0 packaging
+
+
+- name: Add Docker GPG key
+  apt_key:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    state: present
+
+- name: Add Docker repository
+  apt_repository:
+    repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu jammy stable
+    state: present
+
+- name: Install Docker
+  apt:
+    name: docker-ce
+    state: present
+    update_cache: yes
+
+
+- name: Enable and start Docker
+  systemd:
+    name: docker
+    enabled: yes
+    state: started
+
+
+- name: Run Drone container
+  community.docker.docker_container:
+    name: drone
+    image: drone/drone:latest
+    restart_policy: always
+    state: started
+    published_ports:
+      - "80:80"
+    env:
+      DRONE_GITEA_SERVER: "http://10.24.17.54:3000"
+      DRONE_GITEA_CLIENT_ID: "81227805-7d5c-43a8-9f8b-b855b6b8f880"
+      DRONE_GITEA_CLIENT_SECRET: "gto_wza7glprdmurrn34tcqovlaw2u2sjylc6o4c6jkqxxgt5cy5kdxq"
+      DRONE_RPC_SECRET: "supersecret"
+      DRONE_SERVER_HOST: "http://10.24.17.55:80"
+      DRONE_SERVER_PROTO: "http"
+    privileged: true
+    security_opts:
+      - "apparmor=unconfined"
+    volumes:
+      - drone_data:/data
+    api_version: "1.48"
+    docker_host: "unix:///var/run/docker.sock"
+
+
+
+- name: Run Drone runner container
+  community.docker.docker_container:
+    name: drone-runner
+    image: drone/drone-runner-docker:latest
+    restart_policy: always
+    state: started
+    env:
+      DRONE_RPC_HOST: "10.24.17.55:80"  # Your Drone server URL
+      DRONE_SERVER_PROTO: "http"
+      DRONE_RPC_SECRET: "supersecret"  # The same secret you use for the Drone server
+      DRONE_RUNNER_CAPACITY: "2"  # Number of parallel jobs the runner can handle
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock  # For Docker-in-Docker support
+    privileged: true
+    security_opts:
+      - "apparmor=unconfined"

@@ -1,0 +1,205 @@
+- name: Destroy existing vm if it exists
+  hosts: localhost
+  vars_files:
+    - vault.yml
+  tasks:
+    - name: Stop the VM
+      community.general.proxmox:
+        api_user: "{{ vault_proxmox_user }}"
+        api_token_id: "{{ vault_proxmox_token_id }}"
+        api_token_secret: "{{ vault_proxmox_token }}"
+        api_host: "{{ vault_proxmox_host }}"
+        validate_certs: no
+        vmid: 200
+        node: "pve00"
+        state: stopped  # Stop the VM before deleting
+      ignore_errors: true #In case it does not exist
+
+    - name: destroy
+      community.general.proxmox:
+        api_user: "{{ vault_proxmox_user }}"
+        api_token_id: "{{ vault_proxmox_token_id }}"
+        api_token_secret: "{{ vault_proxmox_token }}"
+        api_host: "{{ vault_proxmox_host }}"
+        validate_certs: no
+        vmid: 200
+        node: "pve00"
+        state: absent
+      ignore_errors: true  # in case it's does not exist
+
+- name: Create Ubuntu VM on Proxmox and install Drone CI
+  hosts: localhost
+  vars_files:
+    - vault.yml
+  gather_facts: true
+  tasks:
+    - name: Create VM
+      community.general.proxmox:
+        api_user: "{{ vault_proxmox_user }}"
+        api_token_id: "{{ vault_proxmox_token_id}}"
+        api_token_secret: "{{ vault_proxmox_token }}"
+        api_host: "{{ vault_proxmox_host }}"
+        validate_certs: no
+        vmid: 200
+        node: "pve00"
+        hostname: "drone-ci"
+        cores: 2
+        memory: 2048
+        netif: '{"net0": "bridge=vmbr0,ip=manual,name=eth0"}'
+        ostemplate: "local:vztmpl/ubuntu-24.10-standard_24.10-1_amd64.tar.zst"
+        storage: local-lvm
+        disk: local-lvm:16
+        state: present
+        timeout: 300
+
+- name: Allow Docker to run inside LXC on Proxmox
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Add LXC config overrides to allow Docker-in-LXC
+      lineinfile:
+        path: "/etc/pve/lxc/200.conf"
+        line: "{{ item }}"
+        create: yes
+        state: present
+      loop:
+        - 'lxc.apparmor.profile: unconfined'
+        - 'lxc.cgroup2.devices.allow: a'
+        - 'lxc.cap.drop:'
+        - 'lxc.mount.auto: proc:rw sys:rw'
+        - 'lxc.mount.entry: /dev/fuse dev/fuse none bind,create=file'
+      delegate_to: pve00
+
+- name: Configure
+  hosts: localhost
+  vars_files:
+    - vault.yml
+  tasks:
+    - name: Start the containter
+      community.general.proxmox:
+        api_user: "{{ vault_proxmox_user }}"
+        api_token_id: "{{ vault_proxmox_token_id }}"
+        api_token_secret: "{{ vault_proxmox_token }}"
+        api_host: "{{ vault_proxmox_host }}"
+        validate_certs: no
+        vmid: 200
+        node: "pve00"
+        state: started  # Start the VM after it has been created
+
+    - name: remove old ssh host
+      ansible.builtin.command:
+        cmd: ssh-keygen -f "/root/.ssh/known_hosts" -R "10.24.17.55"
+      ignore_errors: yes
+
+
+    - name: set ethernet adapter up
+      ansible.builtin.command: pct exec 200 -- bash -c "ip link set dev eth0 up"
+      delegate_to: pve00
+      become: true
+
+    - name: Assign ip and gateway
+      ansible.builtin.command: pct exec 200 -- bash -c "ip addr add 10.24.17.55/24 dev eth0 && ip route add default via 10.24.17.1"
+      delegate_to: pve00
+      become: true
+
+    - name: Assign a hostname
+      ansible.builtin.command: pct exec 200 -- bash -c "hostnamectl set-hostname drone-ci"
+      delegate_to: pve00
+      become: true
+
+    - name: Add Nameserver
+      ansible.builtin.command: >
+        pct exec 200 -- bash -c "echo 'nameserver 8.8.8.8' >> /etc/resolv.conf"
+      delegate_to: pve00
+      become: true
+
+
+    - name: Create ansible user
+      ansible.builtin.command: pct exec 200 -- bash -c "useradd -m -s /bin/bash ansible"
+      delegate_to: pve00
+      become: true
+
+    - name: Create .ssh directory
+      ansible.builtin.command: pct exec 200 -- bash -c "mkdir -p /home/ansible/.ssh"
+      delegate_to: pve00
+      become: true
+
+    - name: Add public key to authorized_keys
+      ansible.builtin.command: >
+        pct exec 200 -- bash -c "echo '{{ lookup('file', 'files/drone_shh.pub') }}' > /home/ansible/.ssh/authorized_keys"
+      delegate_to: pve00
+      become: true
+
+    - name: Set permissions on .ssh
+      ansible.builtin.command: pct exec 200 -- bash -c "chmod 700 /home/ansible/.ssh"
+      delegate_to: pve00
+      become: true
+
+    - name: Set permissions on authorized_keys
+      ansible.builtin.command: pct exec 200 -- bash -c "chmod 600 /home/ansible/.ssh/authorized_keys"
+      delegate_to: pve00
+      become: true
+
+    - name: Set ownership
+      ansible.builtin.command: pct exec 200 -- bash -c "chown -R ansible:ansible /home/ansible/.ssh"
+      delegate_to: pve00
+      become: true
+
+    - name: Install openssh-server
+      ansible.builtin.command: pct exec 200 -- bash -c "apt update && apt install -y openssh-server"
+      delegate_to: pve00
+      become: true
+
+    - name: Enable ssh service
+      ansible.builtin.command: pct exec 200 -- bash -c "systemctl enable ssh && systemctl start ssh"
+      delegate_to: pve00
+      become: true
+
+
+    - name: Allow ansible user passwordless sudo
+      ansible.builtin.command: >
+        pct exec 200 -- bash -c "echo 'ansible ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/ansible"
+      delegate_to: pve00
+      become: true
+
+    - name: Set permissions on sudoers file
+      ansible.builtin.command: pct exec 200 -- bash -c "chmod 440 /etc/sudoers.d/ansible"
+      delegate_to: pve00
+      become: true
+
+    - name: Wait for SSH to come up
+      wait_for:
+        host: 10.24.17.55
+        port: 22
+        timeout: 300
+        state: started
+
+
+- name: Provision Python virtualenv on host
+  tags:
+    - service
+  hosts: drone_ci
+  gather_facts: false
+  tasks:
+    - name: Ensure Python venv tools are installed
+      apt:
+        name: python3-venv
+        state: present
+      become: true
+
+    - name: Create virtualenv
+      command: python3 -m venv /opt/ansible_venv
+      args:
+        creates: /opt/ansible_venv/bin/activate
+      become: true
+
+
+- name: Install Drone CI
+  hosts: drone_ci
+  vars:
+    ansible_python_interpreter: /opt/ansible_venv/bin/python
+  become: true
+  roles:
+    - drone
+
+

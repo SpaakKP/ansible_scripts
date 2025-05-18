@@ -1,0 +1,57 @@
+---
+- name: Create Application VM
+  hosts: proxmox_node
+  become: true
+
+  vars:
+    vm_id: 104
+    vm_name: "application-vm"
+    vm_memory: 2048
+    vm_cores: 2
+    vm_disk_size: "16"
+    storage_pool: "local-lvm"
+
+  tasks:
+    - name: Check if VM already exists
+      shell: qm list | grep -w "{{ vm_id }}"
+      register: vm_exists
+      failed_when: false
+      changed_when: false
+
+    - name: Remove old VM if it exists
+      shell: qm destroy {{ vm_id }}
+      when: vm_exists.rc == 0
+
+    - name: Check if Ubuntu Server ISO exists
+      stat:
+        path: "/var/lib/vz/template/iso/ubuntu-24.04.2-live-server-amd64.iso"
+      register: iso_check
+
+    - name: Download Ubuntu Server ISO if not present
+      get_url:
+        url: "https://mirror.ams.macarne.com/ubuntu-releases/24.04.2/ubuntu-24.04.2-live-server-amd64"
+        dest: "/var/lib/vz/template/iso/ubuntu-24.04.2-live-server-amd64.iso"
+        mode: '0644'
+      when: not iso_check.stat.exists
+
+    - name: Create VM
+      shell: >
+        qm create {{ vm_id }}
+        --name {{ vm_name }}
+        --memory {{ vm_memory }}
+        --cores {{ vm_cores }}
+        --net0 virtio,bridge=vmbr0
+        --ostype l26
+        --scsihw virtio-scsi-pci
+        --scsi0 {{ storage_pool }}:{{ vm_disk_size }}
+        --ide0 local:iso/ubuntu-24.04.2-live-server-amd64.iso,media=cdrom
+        --boot order=ide0
+        --bootdisk scsi0
+        --serial0 socket
+        --vga std
+        --agent enabled=1
+        --kvm 0
+      register: vm_create_result
+
+    - name: Start VM
+      shell: qm start {{ vm_id }}

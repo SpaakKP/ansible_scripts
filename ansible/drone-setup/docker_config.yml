@@ -1,0 +1,17 @@
+- name: Ensure Docker daemon.json disables AppArmor
+  ansible.builtin.copy:
+    dest: /etc/docker/daemon.json
+    content: |
+      {
+        "apparmor-profile": "unconfined"
+      }
+    mode: '0644'
+    owner: root
+    group: root
+
+- name: Restart Docker to apply AppArmor setting
+  ansible.builtin.service:
+    name: docker
+    state: restarted
+    enabled: true
+
